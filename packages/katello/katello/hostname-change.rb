@@ -8,6 +8,7 @@ require "uri"
 require "fileutils"
 require "highline/import"
 require "tempfile"
+require "resolv"
 require_relative "helper.rb"
 
 module KatelloUtilities
@@ -239,6 +240,103 @@ module KatelloUtilities
       @opt_parser.parse!
     end
 
+    def get_dns_data
+      STDOUT.puts 'gathering DNS data...'
+      local_ip = '127.0.0.1'
+      zone = @scenario_answers['foreman_proxy']['dns_zone']
+      old_fqdn = @old_hostname
+      soa_admin_domain = "root.#{zone}"
+      begin
+        query_dns = Resolv::DNS.new(nameserver: [local_ip], search: [zone], ndots: 1)
+        a_record = query_dns.getresource(old_fqdn, Resolv::DNS::Resource::IN::A)
+        existing_ip = a_record.address.to_s if a_record
+        soa_record = query_dns.getresource(zone, Resolv::DNS::Resource::IN::SOA)
+        existing_serial = soa_record.serial if soa_record
+        new_serial = (existing_serial + 1).to_s if existing_serial
+      rescue Resolv::ResolvError => e
+        STDOUT.puts e
+        STDOUT.puts 'Parsing zone file as fallback'
+        run_cmd('rndc freeze')
+        zone_file = "/var/named/dynamic/db.#{zone}"
+        zone_file_data = File.read(zone_file).split("\n")
+        a_record = zone_file_data.find { |line| line.include?(' A ') }
+        existing_ip = a_record.split(' A ').last if a_record
+        serial_line = zone_file_data.find { |line| line.include?('Serial') }
+        existing_serial = serial_line.split('Serial').first.to_i if serial_line
+        new_serial = (existing_serial + 1).to_s if existing_serial
+      ensure
+        run_cmd('rndc thaw')
+      end
+      new_fqdn = @new_hostname
+      key_file = @scenario_answers['foreman_proxy']['keyfile']
+      reverse_zone = @scenario_answers['foreman_proxy']['dns_reverse']
+      if reverse_zone.is_a?(Array)
+        reverse_zone = reverse_zone.first
+      end
+
+      {
+        local_ip: local_ip,
+        zone: zone,
+        old_fqdn: old_fqdn,
+        soa_admin_domain: soa_admin_domain,
+        existing_ip: existing_ip,
+        new_serial: new_serial,
+        new_fqdn: new_fqdn,
+        key_file: key_file,
+        reverse_zone: reverse_zone
+      }
+    end
+
+    def update_dns_records(dns_data = {})
+      dns_data.each { |k, v| raise "Error gathering DNS data: couldn't find value for '#{k}'" unless v }
+
+      local_ip = dns_data[:local_ip]
+      zone = dns_data[:zone]
+      old_fqdn = dns_data[:old_fqdn]
+      soa_admin_domain = dns_data[:soa_admin_domain]
+      existing_ip = dns_data[:existing_ip]
+      new_serial = dns_data[:new_serial]
+      new_fqdn = dns_data[:new_fqdn]
+      key_file = dns_data[:key_file]
+      reverse_zone = dns_data[:reverse_zone]
+
+      STDOUT.puts 'updating DNS records:'
+      # Use nsupdate to update DNS records
+      # Update SOA record to new hostname; add new A and NS records; delete old A and NS records.
+      # Multi-line strings are not indented because Ruby 2.0 doesn't support <<~ heredocs
+
+      forward_dns_command = <<-HEREDOC
+echo -e "local #{local_ip}
+zone #{zone}
+update add #{zone} 10800 SOA #{new_fqdn} #{soa_admin_domain}. #{new_serial} 86400 3600 604800 3600
+update add #{zone}. 3600 IN NS #{new_fqdn}.
+update delete #{zone}. IN NS #{old_fqdn}
+update delete #{old_fqdn} A
+update add #{new_fqdn} 86400 A #{existing_ip}
+send
+" | nsupdate -l -k #{key_file}
+      HEREDOC
+
+      reverse_dns_command = <<-HEREDOC
+echo -e \"local #{local_ip}
+zone #{reverse_zone}
+update add #{reverse_zone} 10800 SOA #{new_fqdn} root.#{reverse_zone}. #{new_serial} 86400 3600 604800 3600
+update add #{reverse_zone} 3600 IN NS #{new_fqdn}
+update delete #{reverse_zone} IN NS #{old_fqdn}
+send
+" | nsupdate -l -k #{key_file}
+      HEREDOC
+
+      STDOUT.puts 'forward...'
+      run_cmd(forward_dns_command)
+      STDOUT.puts 'reverse...'
+      run_cmd(reverse_dns_command)
+      STDOUT.puts 'updating dynamic zone files...'
+      run_cmd('rndc freeze')
+      run_cmd('rndc thaw')
+      STDOUT.puts 'DNS records updated'
+    end
+
     def run
       raise 'Must run as root' unless Process.uid == 0
 
@@ -346,50 +444,8 @@ module KatelloUtilities
       self.run_cmd("sed -i -e 's/#{@old_hostname}/#{@new_hostname}/g' #{scenarios_path}/*.yaml")
 
       if @scenario_answers['foreman_proxy']['dns']
-        STDOUT.puts 'gathering DNS data...'
-        local_ip = '127.0.0.1'
-        zone = @scenario_answers['foreman_proxy']['dns_zone']
-        old_fqdn = @old_hostname
-        soa_admin_domain = "root.#{zone}"
-        zone_file = "/var/named/dynamic/db.#{zone}"
-        zone_file_data = File.read(zone_file).split("\n")
-        a_record = zone_file_data.find { |line| line.include?(' A ') }
-        existing_ip = a_record.split(' A ').last if a_record
-        serial_line = zone_file_data.find { |line| line.include?('Serial') }
-        existing_serial = serial_line.split('Serial').first.to_i if serial_line
-        new_serial = (existing_serial + 1).to_s if existing_serial
-        new_fqdn = @new_hostname
-        key_file = '/etc/rndc.key'
-        reverse_zone = @scenario_answers['foreman_proxy']['dns_reverse'].first
-
-        dns_data = {
-          local_ip: local_ip,
-          zone: zone,
-          old_fqdn: old_fqdn,
-          soa_admin_domain: soa_admin_domain,
-          zone_file_data: zone_file_data,
-          existing_ip: existing_ip,
-          new_serial: new_serial,
-          new_fqdn: new_fqdn,
-          key_file: key_file,
-          reverse_zone: reverse_zone
-        }
-        dns_data.each { |k, v| raise "Error gathering DNS data: value for '#{k}' is missing" unless v }
-
-        STDOUT.puts 'updating DNS records:'
-        # Use nsupdate to update DNS records
-        # Update SOA record to new hostname; add new A and NS records; delete old A and NS records.
-        forward_dns_command = "echo -e \"local #{local_ip}\n zone #{zone}\n update add #{zone} 10800 SOA #{new_fqdn} #{soa_admin_domain}. #{new_serial} 86400 3600 604800 3600\n update add #{zone}. 3600 IN NS #{new_fqdn}.\n update delete #{zone}. IN NS #{old_fqdn}\n update delete #{old_fqdn} A\n update add #{new_fqdn} 86400 A #{existing_ip}\n send\n\" | nsupdate -l -k #{key_file}"
-        reverse_dns_command = "echo -e \"local #{local_ip}\n zone #{reverse_zone}\n update add #{reverse_zone} 10800 SOA #{new_fqdn} root.#{reverse_zone}. #{new_serial} 86400 3600 604800 3600\n update add #{reverse_zone} 3600 IN NS #{new_fqdn}\n update delete #{reverse_zone} IN NS #{old_fqdn}\n send\n\" | nsupdate -l -k #{key_file}"
-
-        STDOUT.puts 'forward...'
-        run_cmd(forward_dns_command)
-        STDOUT.puts 'reverse...'
-        run_cmd(reverse_dns_command)
-        STDOUT.puts 'updating dynamic zone files...'
-        run_cmd('rndc freeze')
-        run_cmd('rndc thaw')
-        STDOUT.puts 'DNS records updated'
+        dns_data = get_dns_data
+        update_dns_records(dns_data)
       end
 
       if File.exist?(last_scenario_yaml)
