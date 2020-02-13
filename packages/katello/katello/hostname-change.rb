@@ -240,39 +240,63 @@ module KatelloUtilities
       @opt_parser.parse!
     end
 
+    def query_dns_server(fqdn, zone, local_ip)
+      query_dns = Resolv::DNS.new(nameserver: [local_ip], search: [zone], ndots: 1)
+      a_record = query_dns.getresource(fqdn, Resolv::DNS::Resource::IN::A)
+      existing_ip = a_record.address.to_s if a_record
+      soa_record = query_dns.getresource(zone, Resolv::DNS::Resource::IN::SOA)
+      existing_serial = soa_record.serial if soa_record
+      new_serial = (existing_serial + 1).to_s if existing_serial
+      {
+        existing_ip: existing_ip,
+        new_serial: new_serial
+      }
+    end
+
+    def parse_zone_file(zone_file)
+      run_cmd('rndc freeze')
+      zone_file_data = File.read(zone_file).split("\n")
+      # find the character A enclosed by any whitespace chars
+      a_record = zone_file_data.find { |line| !(line =~ /\sA\s/).nil? }
+      existing_ip = a_record.split('A').last.strip if a_record
+      serial_line = zone_file_data.find { |line| line.downcase.include?('serial') }
+      existing_serial = serial_line.split('Serial').first.to_i if serial_line
+      new_serial = (existing_serial + 1).to_s if existing_serial
+      {
+        existing_ip: existing_ip,
+        new_serial: new_serial
+      }
+    end
+
     def get_dns_data
       STDOUT.puts 'gathering DNS data...'
       local_ip = '127.0.0.1'
       zone = @scenario_answers['foreman_proxy']['dns_zone']
-      old_fqdn = @old_hostname
-      soa_admin_domain = "root.#{zone}"
-      begin
-        query_dns = Resolv::DNS.new(nameserver: [local_ip], search: [zone], ndots: 1)
-        a_record = query_dns.getresource(old_fqdn, Resolv::DNS::Resource::IN::A)
-        existing_ip = a_record.address.to_s if a_record
-        soa_record = query_dns.getresource(zone, Resolv::DNS::Resource::IN::SOA)
-        existing_serial = soa_record.serial if soa_record
-        new_serial = (existing_serial + 1).to_s if existing_serial
-      rescue Resolv::ResolvError => e
-        STDOUT.puts e
-        STDOUT.puts 'Parsing zone file as fallback'
-        run_cmd('rndc freeze')
-        zone_file = "/var/named/dynamic/db.#{zone}"
-        zone_file_data = File.read(zone_file).split("\n")
-        a_record = zone_file_data.find { |line| line.include?(' A ') }
-        existing_ip = a_record.split(' A ').last if a_record
-        serial_line = zone_file_data.find { |line| line.include?('Serial') }
-        existing_serial = serial_line.split('Serial').first.to_i if serial_line
-        new_serial = (existing_serial + 1).to_s if existing_serial
-      ensure
-        run_cmd('rndc thaw')
-      end
-      new_fqdn = @new_hostname
-      key_file = @scenario_answers['foreman_proxy']['keyfile']
       reverse_zone = @scenario_answers['foreman_proxy']['dns_reverse']
       if reverse_zone.is_a?(Array)
         reverse_zone = reverse_zone.first
       end
+      old_fqdn = @old_hostname
+      soa_admin_domain = "root.#{zone}"
+      new_fqdn = @new_hostname
+      key_file = @scenario_answers['foreman_proxy']['keyfile']
+      begin
+        STDOUT.puts 'querying local DNS server...'
+        ip_serial_data = query_dns_server(old_fqdn, zone, local_ip)
+        existing_ip = ip_serial_data[:existing_ip]
+        new_serial = ip_serial_data[:new_serial]
+        new_reverse_serial = query_dns_server(old_fqdn, reverse_zone, local_ip)[:new_serial]
+      rescue Resolv::ResolvError => e
+        STDOUT.puts e
+        STDOUT.puts 'Parsing zone file as fallback'
+        ip_serial_data = parse_zone_file("/var/named/dynamic/db.#{zone}")
+        existing_ip = ip_serial_data[:existing_ip]
+        new_serial = ip_serial_data[:new_serial]
+        new_reverse_serial = parse_zone_file("/var/named/dynamic/db.#{reverse_zone}")[:new_serial]
+      ensure
+        run_cmd('rndc thaw')
+      end
+
 
       {
         local_ip: local_ip,
@@ -281,14 +305,23 @@ module KatelloUtilities
         soa_admin_domain: soa_admin_domain,
         existing_ip: existing_ip,
         new_serial: new_serial,
+        new_reverse_serial: new_reverse_serial,
         new_fqdn: new_fqdn,
         key_file: key_file,
         reverse_zone: reverse_zone
       }
     end
 
+    def nsupdate_command(dns_entries, key_file)
+      "echo -e \"#{dns_entries}\" | nsupdate -l -k #{key_file}"
+    end
+
     def update_dns_records(dns_data = {})
-      dns_data.each { |k, v| raise "Error gathering DNS data: couldn't find value for '#{k}'" unless v }
+      dns_data.each do |key, value|
+        unless value
+          raise "Error gathering DNS data: couldn't find value for '#{key}'"
+        end
+      end
 
       local_ip = dns_data[:local_ip]
       zone = dns_data[:zone]
@@ -296,6 +329,7 @@ module KatelloUtilities
       soa_admin_domain = dns_data[:soa_admin_domain]
       existing_ip = dns_data[:existing_ip]
       new_serial = dns_data[:new_serial]
+      new_reverse_serial = dns_data[:new_reverse_serial]
       new_fqdn = dns_data[:new_fqdn]
       key_file = dns_data[:key_file]
       reverse_zone = dns_data[:reverse_zone]
@@ -306,7 +340,7 @@ module KatelloUtilities
       # Multi-line strings are not indented because Ruby 2.0 doesn't support <<~ heredocs
 
       forward_dns_command = <<-HEREDOC
-echo -e "local #{local_ip}
+local #{local_ip}
 zone #{zone}
 update add #{zone} 10800 SOA #{new_fqdn} #{soa_admin_domain}. #{new_serial} 86400 3600 604800 3600
 update add #{zone}. 3600 IN NS #{new_fqdn}.
@@ -314,23 +348,21 @@ update delete #{zone}. IN NS #{old_fqdn}
 update delete #{old_fqdn} A
 update add #{new_fqdn} 86400 A #{existing_ip}
 send
-" | nsupdate -l -k #{key_file}
       HEREDOC
 
       reverse_dns_command = <<-HEREDOC
-echo -e \"local #{local_ip}
+local #{local_ip}
 zone #{reverse_zone}
-update add #{reverse_zone} 10800 SOA #{new_fqdn} root.#{reverse_zone}. #{new_serial} 86400 3600 604800 3600
+update add #{reverse_zone} 10800 SOA #{new_fqdn} root.#{reverse_zone}. #{new_reverse_serial} 86400 3600 604800 3600
 update add #{reverse_zone} 3600 IN NS #{new_fqdn}
 update delete #{reverse_zone} IN NS #{old_fqdn}
 send
-" | nsupdate -l -k #{key_file}
       HEREDOC
 
       STDOUT.puts 'forward...'
-      run_cmd(forward_dns_command)
+      run_cmd nsupdate_command(forward_dns_command, key_file)
       STDOUT.puts 'reverse...'
-      run_cmd(reverse_dns_command)
+      run_cmd nsupdate_command(reverse_dns_command, key_file)
       STDOUT.puts 'updating dynamic zone files...'
       run_cmd('rndc freeze')
       run_cmd('rndc thaw')
