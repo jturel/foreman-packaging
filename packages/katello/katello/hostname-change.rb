@@ -9,6 +9,7 @@ require "fileutils"
 require "highline/import"
 require "tempfile"
 require "resolv"
+require "ostruct"
 require_relative "helper.rb"
 
 module KatelloUtilities
@@ -323,16 +324,7 @@ module KatelloUtilities
         end
       end
 
-      local_ip = new_dns_values[:local_ip]
-      zone = new_dns_values[:zone]
-      old_fqdn = new_dns_values[:old_fqdn]
-      soa_admin_domain = new_dns_values[:soa_admin_domain]
-      ip = new_dns_values[:ip]
-      new_serial = new_dns_values[:new_serial]
-      new_reverse_serial = new_dns_values[:new_reverse_serial]
-      new_fqdn = new_dns_values[:new_fqdn]
-      key_file = new_dns_values[:key_file]
-      reverse_zone = new_dns_values[:reverse_zone]
+      d = OpenStruct.new(new_dns_values)
 
       STDOUT.puts 'updating DNS records:'
       # Use nsupdate to update DNS records
@@ -340,29 +332,29 @@ module KatelloUtilities
       # Multi-line strings are not indented because Ruby 2.0 doesn't support <<~ heredocs
 
       forward_dns_command = <<-HEREDOC
-local #{local_ip}
-zone #{zone}
-update add #{zone} 10800 SOA #{new_fqdn} #{soa_admin_domain}. #{new_serial} 86400 3600 604800 3600
-update add #{zone}. 3600 IN NS #{new_fqdn}.
-update delete #{zone}. IN NS #{old_fqdn}
-update delete #{old_fqdn} A
-update add #{new_fqdn} 86400 A #{ip}
+local #{d.local_ip}
+zone #{d.zone}
+update add #{d.zone} 10800 SOA #{d.new_fqdn} #{d.soa_admin_domain}. #{d.new_serial} 86400 3600 604800 3600
+update add #{d.zone}. 3600 IN NS #{d.new_fqdn}.
+update delete #{d.zone}. IN NS #{d.old_fqdn}
+update delete #{d.old_fqdn} A
+update add #{d.new_fqdn} 86400 A #{d.ip}
 send
       HEREDOC
 
       reverse_dns_command = <<-HEREDOC
-local #{local_ip}
-zone #{reverse_zone}
-update add #{reverse_zone} 10800 SOA #{new_fqdn} root.#{reverse_zone}. #{new_reverse_serial} 86400 3600 604800 3600
-update add #{reverse_zone} 3600 IN NS #{new_fqdn}
-update delete #{reverse_zone} IN NS #{old_fqdn}
+local #{d.local_ip}
+zone #{d.reverse_zone}
+update add #{d.reverse_zone} 10800 SOA #{d.new_fqdn} root.#{d.reverse_zone}. #{d.new_reverse_serial} 86400 3600 604800 3600
+update add #{d.reverse_zone} 3600 IN NS #{d.new_fqdn}
+update delete #{d.reverse_zone} IN NS #{d.old_fqdn}
 send
       HEREDOC
 
       STDOUT.puts 'forward...'
-      run_cmd nsupdate_command(forward_dns_command, key_file)
+      run_cmd nsupdate_command(forward_dns_command, d.key_file)
       STDOUT.puts 'reverse...'
-      run_cmd nsupdate_command(reverse_dns_command, key_file)
+      run_cmd nsupdate_command(reverse_dns_command, d.key_file)
       STDOUT.puts 'updating dynamic zone files...'
       run_cmd('rndc freeze')
       run_cmd('rndc thaw')
