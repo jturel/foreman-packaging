@@ -282,18 +282,18 @@ module KatelloUtilities
         ip_serial_data = query_dns_server(@old_hostname, zone, local_ip)
         ip = ip_serial_data[:ip]
         serial = ip_serial_data[:serial]
-        new_serial = (serial + 1).to_s if serial
+        new_serial = serial + 1 if serial
         reverse_serial = query_dns_server(@old_hostname, reverse_zone, local_ip)[:serial]
-        new_reverse_serial = (reverse_serial + 1).to_s if reverse_serial
+        new_reverse_serial = reverse_serial + 1 if reverse_serial
       rescue Resolv::ResolvError => e
         STDOUT.puts e
         STDOUT.puts 'Parsing zone file as fallback'
         ip_serial_data = parse_zone_file("/var/named/dynamic/db.#{zone}")
         ip = ip_serial_data[:ip]
         serial = ip_serial_data[:serial]
-        new_serial = (serial + 1).to_s if serial
+        new_serial = serial + 1 if serial
         reverse_serial = parse_zone_file("/var/named/dynamic/db.#{reverse_zone}")[:serial]
-        new_reverse_serial = (reverse_serial + 1).to_s if reverse_serial
+        new_reverse_serial = reverse_serial + 1 if reverse_serial
       ensure
         run_cmd('rndc thaw')
       end
