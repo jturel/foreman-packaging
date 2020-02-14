@@ -100,6 +100,17 @@ module KatelloUtilities
         self.hammer_cmd("capsule list", [0], "There is a problem with the credentials, please retry")
       end
 
+      if @scenario_answers['foreman_proxy']['dns'] && !@options[:skip_dns]
+        begin
+          STDOUT.puts "\nRunning test DNS query"
+          query_dns = Resolv::DNS.new(nameserver: ['127.0.0.1'], search: [], ndots: 1)
+          query_dns.getresource(@old_hostname, Resolv::DNS::Resource::IN::A)
+        rescue Resolv::ResolvError => e
+          STDOUT.puts e
+          self.fail_with_message("Error querying local DNS server.  Make sure the 'named' service is running, or re-run with the --skip-dns option.")
+        end
+      end
+
       if @options[:confirm]
         response = true
       else
@@ -143,7 +154,7 @@ module KatelloUtilities
     end
 
     def warning_message
-      STDOUT.print("***WARNING*** This script will modify your system. " \
+      STDOUT.print("\n***WARNING*** This script will modify your system. " \
                    "You will need to re-register any #{@options[:program]} clients registered to this system after script completion.")
       unless @foreman_proxy_content
         STDOUT.print(" #{ @plural_proxy } will have to be re-registered and reinstalled. If you are using custom certificates, you " \
@@ -215,6 +226,10 @@ module KatelloUtilities
           @options[:confirm] = confirm
         end
 
+        opt.on("--skip-dns", "skip updating DNS records") do |skip_dns|
+          @options[:skip_dns] = skip_dns
+        end
+
         if @foreman_proxy_content
           opt.on("-c",
                  "--certs-tar certs_tar",
@@ -253,78 +268,47 @@ module KatelloUtilities
       }
     end
 
-    def parse_zone_file(zone_file)
-      run_cmd('rndc freeze')
-      zone_file_data = File.read(zone_file).split("\n")
-      # find the character A enclosed by any whitespace chars
-      a_record = zone_file_data.find { |line| !(line =~ /\sA\s/).nil? }
-      ip = a_record.split('A').last.strip if a_record
-      serial_line = zone_file_data.find { |line| line.downcase.include?('serial') }
-      serial = serial_line.split('Serial').first.to_i if serial_line
-      {
-        ip: ip,
-        serial: serial
-      }
-    end
-
     def new_dns_values
       STDOUT.puts 'gathering DNS data...'
-      local_ip = '127.0.0.1'
-      zone = @scenario_answers['foreman_proxy']['dns_zone']
-      reverse_zone = @scenario_answers['foreman_proxy']['dns_reverse']
-      if reverse_zone.is_a?(Array)
-        reverse_zone = reverse_zone.first
+      new_vals = OpenStruct.new
+      new_vals.local_ip = '127.0.0.1'
+      new_vals.zone = @scenario_answers['foreman_proxy']['dns_zone']
+      new_vals.reverse_zone = @scenario_answers['foreman_proxy']['dns_reverse']
+      if new_vals.reverse_zone.is_a?(Array)
+        new_vals.reverse_zone = new_vals.reverse_zone.first
       end
-      soa_admin_domain = "root.#{zone}"
-      key_file = @scenario_answers['foreman_proxy']['keyfile']
-      begin
-        STDOUT.puts 'querying local DNS server...'
-        ip_serial_data = query_dns_server(@old_hostname, zone, local_ip)
-        ip = ip_serial_data[:ip]
-        serial = ip_serial_data[:serial]
-        new_serial = serial + 1 if serial
-        reverse_serial = query_dns_server(@old_hostname, reverse_zone, local_ip)[:serial]
-        new_reverse_serial = reverse_serial + 1 if reverse_serial
-      rescue Resolv::ResolvError => e
-        STDOUT.puts e
-        STDOUT.puts 'Parsing zone file as fallback'
-        ip_serial_data = parse_zone_file("/var/named/dynamic/db.#{zone}")
-        ip = ip_serial_data[:ip]
-        serial = ip_serial_data[:serial]
-        new_serial = serial + 1 if serial
-        reverse_serial = parse_zone_file("/var/named/dynamic/db.#{reverse_zone}")[:serial]
-        new_reverse_serial = reverse_serial + 1 if reverse_serial
-      ensure
-        run_cmd('rndc thaw')
-      end
+      new_vals.soa_admin_domain = "root.#{new_vals.zone}"
+      new_vals.key_file = @scenario_answers['foreman_proxy']['keyfile']
+      new_vals.old_fqdn = @old_hostname
+      new_vals.new_fqdn = @new_hostname
 
+      STDOUT.puts 'querying local DNS server...'
+      ip_serial_data = query_dns_server(@old_hostname, new_vals.zone, new_vals.local_ip)
+      new_vals.ip = ip_serial_data[:ip]
+      serial = ip_serial_data[:serial]
+      new_vals.new_serial = serial + 1 if serial
+      reverse_serial = query_dns_server(@old_hostname, new_vals.reverse_zone, new_vals.local_ip)[:serial]
+      new_vals.new_reverse_serial = reverse_serial + 1 if reverse_serial
+      run_cmd('rndc thaw')
 
-      {
-        local_ip: local_ip,
-        zone: zone,
-        old_fqdn: @old_hostname,
-        soa_admin_domain: soa_admin_domain,
-        ip: ip,
-        new_serial: new_serial,
-        new_reverse_serial: new_reverse_serial,
-        new_fqdn: @new_hostname,
-        key_file: key_file,
-        reverse_zone: reverse_zone
-      }
+      new_vals
     end
 
     def nsupdate_command(dns_entries, key_file)
       "echo -e \"#{dns_entries}\" | nsupdate -l -k #{key_file}"
     end
 
-    def update_dns_records(new_dns_values = {})
-      new_dns_values.each do |key, value|
-        unless value
-          raise "Error gathering DNS data: couldn't find value for '#{key}'"
+    def update_dns_records(d)
+      %w[local_ip zone reverse_zone soa_admin_domain key_file old_fqdn new_fqdn ip new_serial new_reverse_serial].each do |value|
+        unless d[value]
+          fail_with_message """
+  Error gathering DNS data: couldn't find value for '#{value}'.
+  Make sure /etc/foreman-installer/scenarios.d/#{@options[:scenario]}-answers.yaml
+  'foreman-proxy' section has values for dns_zone, dns_reverse, and keyfile.
+  Make sure A and SOA records are present for #{@old_hostname}.
+"""
         end
       end
-
-      d = OpenStruct.new(new_dns_values)
 
       STDOUT.puts 'updating DNS records:'
       # Use nsupdate to update DNS records
@@ -467,7 +451,7 @@ send
       STDOUT.puts "updating hostname in foreman installer scenarios"
       self.run_cmd("sed -i -e 's/#{@old_hostname}/#{@new_hostname}/g' #{scenarios_path}/*.yaml")
 
-      if @scenario_answers['foreman_proxy']['dns']
+      if @scenario_answers['foreman_proxy']['dns'] && !@options[:skip_dns]
         update_dns_records(new_dns_values)
       end
 
