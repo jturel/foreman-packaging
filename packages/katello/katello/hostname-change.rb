@@ -243,12 +243,12 @@ module KatelloUtilities
     def query_dns_server(fqdn, zone, local_ip)
       query_dns = Resolv::DNS.new(nameserver: [local_ip], search: [zone], ndots: 1)
       a_record = query_dns.getresource(fqdn, Resolv::DNS::Resource::IN::A)
-      existing_ip = a_record.address.to_s if a_record
+      ip = a_record.address.to_s if a_record
       soa_record = query_dns.getresource(zone, Resolv::DNS::Resource::IN::SOA)
       existing_serial = soa_record.serial if soa_record
       new_serial = (existing_serial + 1).to_s if existing_serial
       {
-        existing_ip: existing_ip,
+        ip: ip,
         new_serial: new_serial
       }
     end
@@ -258,17 +258,17 @@ module KatelloUtilities
       zone_file_data = File.read(zone_file).split("\n")
       # find the character A enclosed by any whitespace chars
       a_record = zone_file_data.find { |line| !(line =~ /\sA\s/).nil? }
-      existing_ip = a_record.split('A').last.strip if a_record
+      ip = a_record.split('A').last.strip if a_record
       serial_line = zone_file_data.find { |line| line.downcase.include?('serial') }
       existing_serial = serial_line.split('Serial').first.to_i if serial_line
       new_serial = (existing_serial + 1).to_s if existing_serial
       {
-        existing_ip: existing_ip,
+        ip: ip,
         new_serial: new_serial
       }
     end
 
-    def get_dns_data
+    def new_dns_values
       STDOUT.puts 'gathering DNS data...'
       local_ip = '127.0.0.1'
       zone = @scenario_answers['foreman_proxy']['dns_zone']
@@ -276,21 +276,19 @@ module KatelloUtilities
       if reverse_zone.is_a?(Array)
         reverse_zone = reverse_zone.first
       end
-      old_fqdn = @old_hostname
       soa_admin_domain = "root.#{zone}"
-      new_fqdn = @new_hostname
       key_file = @scenario_answers['foreman_proxy']['keyfile']
       begin
         STDOUT.puts 'querying local DNS server...'
-        ip_serial_data = query_dns_server(old_fqdn, zone, local_ip)
-        existing_ip = ip_serial_data[:existing_ip]
+        ip_serial_data = query_dns_server(@old_hostname, zone, local_ip)
+        ip = ip_serial_data[:ip]
         new_serial = ip_serial_data[:new_serial]
-        new_reverse_serial = query_dns_server(old_fqdn, reverse_zone, local_ip)[:new_serial]
+        new_reverse_serial = query_dns_server(@old_hostname, reverse_zone, local_ip)[:new_serial]
       rescue Resolv::ResolvError => e
         STDOUT.puts e
         STDOUT.puts 'Parsing zone file as fallback'
         ip_serial_data = parse_zone_file("/var/named/dynamic/db.#{zone}")
-        existing_ip = ip_serial_data[:existing_ip]
+        ip = ip_serial_data[:ip]
         new_serial = ip_serial_data[:new_serial]
         new_reverse_serial = parse_zone_file("/var/named/dynamic/db.#{reverse_zone}")[:new_serial]
       ensure
@@ -301,12 +299,12 @@ module KatelloUtilities
       {
         local_ip: local_ip,
         zone: zone,
-        old_fqdn: old_fqdn,
+        old_fqdn: @old_hostname,
         soa_admin_domain: soa_admin_domain,
-        existing_ip: existing_ip,
+        ip: ip,
         new_serial: new_serial,
         new_reverse_serial: new_reverse_serial,
-        new_fqdn: new_fqdn,
+        new_fqdn: @new_hostname,
         key_file: key_file,
         reverse_zone: reverse_zone
       }
@@ -316,23 +314,23 @@ module KatelloUtilities
       "echo -e \"#{dns_entries}\" | nsupdate -l -k #{key_file}"
     end
 
-    def update_dns_records(dns_data = {})
-      dns_data.each do |key, value|
+    def update_dns_records(new_dns_values = {})
+      new_dns_values.each do |key, value|
         unless value
           raise "Error gathering DNS data: couldn't find value for '#{key}'"
         end
       end
 
-      local_ip = dns_data[:local_ip]
-      zone = dns_data[:zone]
-      old_fqdn = dns_data[:old_fqdn]
-      soa_admin_domain = dns_data[:soa_admin_domain]
-      existing_ip = dns_data[:existing_ip]
-      new_serial = dns_data[:new_serial]
-      new_reverse_serial = dns_data[:new_reverse_serial]
-      new_fqdn = dns_data[:new_fqdn]
-      key_file = dns_data[:key_file]
-      reverse_zone = dns_data[:reverse_zone]
+      local_ip = new_dns_values[:local_ip]
+      zone = new_dns_values[:zone]
+      old_fqdn = new_dns_values[:old_fqdn]
+      soa_admin_domain = new_dns_values[:soa_admin_domain]
+      ip = new_dns_values[:ip]
+      new_serial = new_dns_values[:new_serial]
+      new_reverse_serial = new_dns_values[:new_reverse_serial]
+      new_fqdn = new_dns_values[:new_fqdn]
+      key_file = new_dns_values[:key_file]
+      reverse_zone = new_dns_values[:reverse_zone]
 
       STDOUT.puts 'updating DNS records:'
       # Use nsupdate to update DNS records
@@ -346,7 +344,7 @@ update add #{zone} 10800 SOA #{new_fqdn} #{soa_admin_domain}. #{new_serial} 8640
 update add #{zone}. 3600 IN NS #{new_fqdn}.
 update delete #{zone}. IN NS #{old_fqdn}
 update delete #{old_fqdn} A
-update add #{new_fqdn} 86400 A #{existing_ip}
+update add #{new_fqdn} 86400 A #{ip}
 send
       HEREDOC
 
@@ -476,8 +474,7 @@ send
       self.run_cmd("sed -i -e 's/#{@old_hostname}/#{@new_hostname}/g' #{scenarios_path}/*.yaml")
 
       if @scenario_answers['foreman_proxy']['dns']
-        dns_data = get_dns_data
-        update_dns_records(dns_data)
+        update_dns_records(new_dns_values)
       end
 
       if File.exist?(last_scenario_yaml)
