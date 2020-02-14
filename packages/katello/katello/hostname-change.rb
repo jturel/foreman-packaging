@@ -245,11 +245,10 @@ module KatelloUtilities
       a_record = query_dns.getresource(fqdn, Resolv::DNS::Resource::IN::A)
       ip = a_record.address.to_s if a_record
       soa_record = query_dns.getresource(zone, Resolv::DNS::Resource::IN::SOA)
-      existing_serial = soa_record.serial if soa_record
-      new_serial = (existing_serial + 1).to_s if existing_serial
+      serial = soa_record.serial if soa_record
       {
         ip: ip,
-        new_serial: new_serial
+        serial: serial,
       }
     end
 
@@ -260,11 +259,10 @@ module KatelloUtilities
       a_record = zone_file_data.find { |line| !(line =~ /\sA\s/).nil? }
       ip = a_record.split('A').last.strip if a_record
       serial_line = zone_file_data.find { |line| line.downcase.include?('serial') }
-      existing_serial = serial_line.split('Serial').first.to_i if serial_line
-      new_serial = (existing_serial + 1).to_s if existing_serial
+      serial = serial_line.split('Serial').first.to_i if serial_line
       {
         ip: ip,
-        new_serial: new_serial
+        serial: serial
       }
     end
 
@@ -282,15 +280,19 @@ module KatelloUtilities
         STDOUT.puts 'querying local DNS server...'
         ip_serial_data = query_dns_server(@old_hostname, zone, local_ip)
         ip = ip_serial_data[:ip]
-        new_serial = ip_serial_data[:new_serial]
-        new_reverse_serial = query_dns_server(@old_hostname, reverse_zone, local_ip)[:new_serial]
+        serial = ip_serial_data[:serial]
+        new_serial = (serial + 1).to_s if serial
+        reverse_serial = query_dns_server(@old_hostname, reverse_zone, local_ip)[:serial]
+        new_reverse_serial = (reverse_serial + 1).to_s if reverse_serial
       rescue Resolv::ResolvError => e
         STDOUT.puts e
         STDOUT.puts 'Parsing zone file as fallback'
         ip_serial_data = parse_zone_file("/var/named/dynamic/db.#{zone}")
         ip = ip_serial_data[:ip]
-        new_serial = ip_serial_data[:new_serial]
-        new_reverse_serial = parse_zone_file("/var/named/dynamic/db.#{reverse_zone}")[:new_serial]
+        serial = ip_serial_data[:serial]
+        new_serial = (serial + 1).to_s if serial
+        reverse_serial = parse_zone_file("/var/named/dynamic/db.#{reverse_zone}")[:serial]
+        new_reverse_serial = (reverse_serial + 1).to_s if reverse_serial
       ensure
         run_cmd('rndc thaw')
       end
