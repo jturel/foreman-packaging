@@ -100,7 +100,7 @@ module KatelloUtilities
         self.hammer_cmd("capsule list", [0], "There is a problem with the credentials, please retry")
       end
 
-      if @scenario_answers['foreman_proxy']['dns'] && !@options[:skip_dns]
+      if should_update_dns?
         begin
           STDOUT.puts "\nRunning test DNS query"
           query_dns = Resolv::DNS.new(nameserver: ['127.0.0.1'], search: [], ndots: 1)
@@ -256,6 +256,12 @@ module KatelloUtilities
       @opt_parser.parse!
     end
 
+    def should_update_dns?
+      @scenario_answers['foreman_proxy']['dns'] &&
+        @scenario_answers['foreman_proxy']['dns_managed'] &&
+        !@options[:skip_dns]
+    end
+
     def query_dns_server(fqdn, zone, local_ip)
       query_dns = Resolv::DNS.new(nameserver: [local_ip], search: [zone], ndots: 1)
       a_record = query_dns.getresource(fqdn, Resolv::DNS::Resource::IN::A)
@@ -345,6 +351,18 @@ send
       STDOUT.puts 'DNS records updated'
     end
 
+    def restore_last_scenario_yaml
+      STDOUT.puts 'restoring last_scenario.yaml'
+      if File.exist?(last_scenario_yaml)
+        run_cmd("cp #{@temp_last_scenario_yaml.path} #{last_scenario_yaml}")
+      else
+        # if the installer failed early the last_scenario symlink won't exist
+        scenario_path = "#{scenarios_path}/#{@options[:scenario]}.yaml"
+        run_cmd("cp #{@temp_last_scenario_yaml.path} #{scenario_path}")
+        File.symlink(scenario_path, last_scenario_yaml)
+      end
+    end
+
     def run
       raise 'Must run as root' unless Process.uid == 0
 
@@ -369,6 +387,23 @@ send
 
       self.precheck
 
+      if should_update_dns?
+        update_dns_records(new_dns_values)
+      end
+
+      STDOUT.puts "updating hostname in /etc/hostname"
+      self.run_cmd("sed -i -e 's/#{@old_hostname}/#{@new_hostname}/g' /etc/hostname")
+      STDOUT.puts "setting hostname"
+      self.run_cmd("hostnamectl set-hostname #{@new_hostname}")
+
+      # override environment variable (won't be updated until bash login)
+      ENV['HOSTNAME'] = @new_hostname
+
+      STDOUT.puts "checking if hostname was changed"
+      if self.get_hostname != @new_hostname
+        self.fail_with_message("The new hostname was not changed successfully, exiting script")
+      end
+
       unless @foreman_proxy_content
         STDOUT.puts "\nUpdating default #{@proxy}"
         proxy_id = self.get_default_proxy_id
@@ -384,19 +419,6 @@ send
           new_path = new_path.to_s
           hammer_cmd("medium update --id #{medium['Id']} --path #{new_path}")
         end
-      end
-
-      STDOUT.puts "updating hostname in /etc/hostname"
-      self.run_cmd("sed -i -e 's/#{@old_hostname}/#{@new_hostname}/g' /etc/hostname")
-      STDOUT.puts "setting hostname"
-      self.run_cmd("hostnamectl set-hostname #{@new_hostname}")
-
-      # override environment variable (won't be updated until bash login)
-      ENV['HOSTNAME'] = @new_hostname
-
-      STDOUT.puts "checking if hostname was changed"
-      if self.get_hostname != @new_hostname
-        self.fail_with_message("The new hostname was not changed successfully, exiting script")
       end
 
       STDOUT.puts "stopping services"
@@ -451,17 +473,17 @@ send
       STDOUT.puts "updating hostname in foreman installer scenarios"
       self.run_cmd("sed -i -e 's/#{@old_hostname}/#{@new_hostname}/g' #{scenarios_path}/*.yaml")
 
-      if @scenario_answers['foreman_proxy']['dns'] && !@options[:skip_dns]
-        update_dns_records(new_dns_values)
-      end
+      STDOUT.puts "updating hostname in hammer configuration"
+      self.run_cmd("sed -i.bak -e 's/#{@old_hostname}/#{@new_hostname}/g' #{hammer_root_config_path}/*.yml")
+      self.run_cmd("sed -i.bak -e 's/#{@old_hostname}/#{@new_hostname}/g' #{hammer_config_path}/*.yml")
 
       if File.exist?(last_scenario_yaml)
         STDOUT.puts 'backing up last_scenario.yaml'
-        temp_last_scenario_yaml = Tempfile.new('last_scenario')
+        @temp_last_scenario_yaml = Tempfile.new('last_scenario')
         begin
-          temp_last_scenario_yaml << File.read(last_scenario_yaml)
+          @temp_last_scenario_yaml << File.read(last_scenario_yaml)
         ensure
-          temp_last_scenario_yaml.close
+          @temp_last_scenario_yaml.close
         end
 
         STDOUT.puts 'removing last_scenario.yaml'
@@ -485,20 +507,12 @@ send
 
       STDOUT.puts installer
       run_cmd(installer, [0], installer_failure_message) do |result, success|
-        if temp_last_scenario_yaml && temp_last_scenario_yaml.path
+        if @temp_last_scenario_yaml && @temp_last_scenario_yaml.path
           unless success
-            STDOUT.puts 'restoring last_scenario.yaml'
-            if File.exist?(last_scenario_yaml)
-              run_cmd("cp #{temp_last_scenario_yaml.path} #{last_scenario_yaml}")
-            else
-              # if the installer failed early the last_scenario symlink won't exist
-              scenario_path = "#{scenarios_path}/#{@options[:scenario]}.yaml"
-              run_cmd("cp #{temp_last_scenario_yaml.path} #{scenario_path}")
-              File.symlink(scenario_path, last_scenario_yaml)
-            end
+            restore_last_scenario_yaml
           end
           STDOUT.puts 'cleaning up temporary files'
-          temp_last_scenario_yaml.unlink
+          @temp_last_scenario_yaml.unlink
         end
 
         if success
