@@ -89,15 +89,15 @@ module KatelloUtilities
       # Taken from https://www.safaribooksonline.com/library/view/regular-expressions-cookbook/9781449327453/ch08s15.html
       hostname_regex = /^([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,}$/
       unless hostname_regex === @new_hostname
-        self.fail_with_message("#{@new_hostname} is not a valid fully qualified domain name, please use a valid FQDN and try again. " \
+        self.fail_with_message("#{@new_hostname} is not a valid fully qualified domain name. Please use a valid FQDN and try again. " \
                           "No changes have been made to your system.");
       end
 
       unless @foreman_proxy_content
         STDOUT.puts "\nChecking overall health of server"
-        self.run_cmd("hammer ping", [0], "There is a problem with the server, please check 'hammer ping'")
+        self.run_cmd("hammer ping", [0], "There is a problem with the server; please check 'hammer ping'")
         STDOUT.puts "\nChecking credentials"
-        self.hammer_cmd("capsule list", [0], "There is a problem with the credentials, please retry")
+        self.hammer_cmd("capsule list", [0], "There is a problem with the credentials; please retry")
       end
 
       if should_update_dns?
@@ -107,20 +107,22 @@ module KatelloUtilities
           query_dns.getresource(@old_hostname, Resolv::DNS::Resource::IN::A)
         rescue Resolv::ResolvError => e
           STDOUT.puts e
-          self.fail_with_message("Error querying local DNS server.  Make sure the 'named' service is running, or re-run with the --skip-dns option.")
+          self.fail_with_message("Error querying local DNS server for #{@old_hostname}.  Make sure the 'named' service is running, or re-run with the --skip-dns option.")
         end
       end
 
-      if @options[:confirm]
-        response = true
-      else
-        STDOUT.print(self.warning_message)
-        response = agree('Proceed with changing your hostname? [y/n]')
+      return if @options[:confirm]
+      questions = []
+      questions << dns_skip_warning if @options[:skip_dns]
+      questions << warning
+      questions.each do |q|
+        STDOUT.puts
+        STDOUT.puts q[:message]
+        unless agree(q[:question])
+          self.fail_with_message("Hostname change aborted; no changes have been made to your system")
+        end
       end
-
-      unless response
-        self.fail_with_message("Hostname change aborted, no changes have been made to your system")
-      end
+      STDOUT.puts "Precheck passed"
     end
 
     def next_steps_message
@@ -153,14 +155,37 @@ module KatelloUtilities
       end
     end
 
-    def warning_message
-      STDOUT.print("\n***WARNING*** This script will modify your system. " \
-                   "You will need to re-register any #{@options[:program]} clients registered to this system after script completion.")
+    def warning
+      msg = <<-HEREDOC
+***WARNING*** This script will modify your system.
+You will need to re-register any #{@options[:program]} clients registered to this system after script completion.
+      HEREDOC
       unless @foreman_proxy_content
-        STDOUT.print(" #{ @plural_proxy } will have to be re-registered and reinstalled. If you are using custom certificates, you " \
-                     "will have to run the #{@options[:program]}-installer again with custom certificate options after this script completes.")
+        msg << "#{@plural_proxy} will have to be re-registered and reinstalled. If you are using custom certificates,\n" \
+                     "you will have to run the #{@options[:program]}-installer again with custom certificate options after this script completes.\n"
       end
-      STDOUT.print(" Have you taken the necessary precautions (backups, snapshots, etc...)?\n")
+      msg << " Have you taken the necessary precautions (backups, snapshots, etc...)?\n"
+      {
+        message: msg,
+        question: 'Proceed with changing your hostname? [y/n]'
+      }
+    end
+
+    def dns_skip_warning
+      msg = <<-HEREDOC
+***WARNING*** Since the --skip-dns option was specified, nsupdate will NOT be run and
+DNS records will NOT be created for #{@new_hostname}. You will need to do the following manually:
+
+- Remove the A and NS records for #{@old_hostname}
+- Update the SOA record for #{@new_hostname}
+- Create new A and NS records for #{@new_hostname}
+
+If not done, all hosts will lose connection to #{@options[:scenario]} and discovery may not work.
+      HEREDOC
+      {
+        message: msg,
+        question: 'Proceed without updating DNS? [y/n]'
+      }
     end
 
     def hammer_cmd(cmd, exit_codes=[0], message=nil)
@@ -210,7 +235,7 @@ module KatelloUtilities
         opt.banner = "usage: #{@command_prefix}-change-hostname hostname [options]"
         opt.separator  ""
         opt.separator  "example:"
-        opt.separator  "#{@command_prefix}-change-hostname foo.example.com -u admin -p changeme"
+        opt.separator  "#{@command_prefix}-change-hostname newhost.example.com -u admin -p changeme"
         opt.separator  ""
         opt.separator  "options"
 
@@ -226,7 +251,7 @@ module KatelloUtilities
           @options[:confirm] = confirm
         end
 
-        opt.on("--skip-dns", "skip updating DNS records") do |skip_dns|
+        opt.on("--skip-dns", "skip updating DNS records even if they are managed by #{@options[:scenario]}") do |skip_dns|
           @options[:skip_dns] = skip_dns
         end
 
@@ -256,10 +281,13 @@ module KatelloUtilities
       @opt_parser.parse!
     end
 
-    def should_update_dns?
+    def dns_managed?
       @scenario_answers['foreman_proxy']['dns'] &&
-        @scenario_answers['foreman_proxy']['dns_managed'] &&
-        !@options[:skip_dns]
+        @scenario_answers['foreman_proxy']['dns_managed']
+    end
+
+    def should_update_dns?
+      dns_managed? && !@options[:skip_dns]
     end
 
     def query_dns_server(fqdn, zone, local_ip)
