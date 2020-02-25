@@ -102,12 +102,21 @@ module KatelloUtilities
 
       if should_update_dns?
         begin
-          STDOUT.puts "\nRunning test DNS query"
-          query_dns = Resolv::DNS.new(nameserver: ['127.0.0.1'], search: [], ndots: 1)
-          query_dns.getresource(@old_hostname, Resolv::DNS::Resource::IN::A)
-        rescue Resolv::ResolvError => e
-          STDOUT.puts e
-          self.fail_with_message("Error querying local DNS server for #{@old_hostname}.  Make sure the 'named' service is running, or re-run with the --skip-dns option.")
+          STDOUT.puts "\nAssembling data for DNS update"
+          @new_dns_values = new_dns_values
+        rescue StandardError => e # could not reach the DNS server, or something broke while assembling the data
+          fail_with_message("Error querying local DNS server for #{@old_hostname}. Make sure the 'named' service is running, or re-run with the --skip-dns option.")
+        end
+
+        %w[dns_server zone reverse_zone soa_admin_domain key_file old_fqdn new_fqdn ip new_serial new_reverse_serial].each do |field|
+          next if @new_dns_values[field]
+
+          fail_with_message """
+    Error gathering DNS data: couldn't find value for '#{field}'.
+    Make sure /etc/foreman-installer/scenarios.d/#{@options[:scenario]}-answers.yaml
+    'foreman-proxy' section has values for dns_zone, dns_reverse, and keyfile.
+    Make sure A and SOA records are present for #{@old_hostname}.
+"""
         end
       end
 
@@ -290,39 +299,34 @@ If not done, all hosts will lose connection to #{@options[:scenario]} and discov
       dns_managed? && !@options[:skip_dns]
     end
 
-    def query_dns_server(fqdn, zone, local_ip)
-      query_dns = Resolv::DNS.new(nameserver: [local_ip], search: [zone], ndots: 1)
+    def query_dns_server(fqdn, zone, nameserver_ip)
+      query_dns = Resolv::DNS.new(nameserver: [nameserver_ip], search: [zone], ndots: 1)
       a_record = query_dns.getresource(fqdn, Resolv::DNS::Resource::IN::A)
-      ip = a_record.address.to_s if a_record
       soa_record = query_dns.getresource(zone, Resolv::DNS::Resource::IN::SOA)
-      serial = soa_record.serial if soa_record
       {
-        ip: ip,
-        serial: serial,
+        ip: a_record.address,
+        serial: soa_record.serial
       }
     end
 
     def new_dns_values
-      STDOUT.puts 'gathering DNS data...'
       new_vals = OpenStruct.new
-      new_vals.local_ip = '127.0.0.1'
+
+      new_vals.dns_server = @scenario_answers['foreman_proxy']['dns_server']
       new_vals.zone = @scenario_answers['foreman_proxy']['dns_zone']
-      new_vals.reverse_zone = @scenario_answers['foreman_proxy']['dns_reverse']
-      if new_vals.reverse_zone.is_a?(Array)
-        new_vals.reverse_zone = new_vals.reverse_zone.first
-      end
+      new_vals.reverse_zone = @scenario_answers['foreman_proxy']['dns_reverse'].first
       new_vals.soa_admin_domain = "root.#{new_vals.zone}"
       new_vals.key_file = @scenario_answers['foreman_proxy']['keyfile']
       new_vals.old_fqdn = @old_hostname
       new_vals.new_fqdn = @new_hostname
 
-      STDOUT.puts 'querying local DNS server...'
-      ip_serial_data = query_dns_server(@old_hostname, new_vals.zone, new_vals.local_ip)
+      ip_serial_data = query_dns_server(@old_hostname, new_vals.zone, new_vals.dns_server)
       new_vals.ip = ip_serial_data[:ip]
       serial = ip_serial_data[:serial]
-      new_vals.new_serial = serial + 1 if serial
-      reverse_serial = query_dns_server(@old_hostname, new_vals.reverse_zone, new_vals.local_ip)[:serial]
-      new_vals.new_reverse_serial = reverse_serial + 1 if reverse_serial
+      new_vals.new_serial = serial + 1
+
+      reverse_serial = query_dns_server(@old_hostname, new_vals.reverse_zone, new_vals.dns_server)[:serial]
+      new_vals.new_reverse_serial = reverse_serial + 1
       run_cmd('rndc thaw')
 
       new_vals
@@ -333,24 +337,13 @@ If not done, all hosts will lose connection to #{@options[:scenario]} and discov
     end
 
     def update_dns_records(d)
-      %w[local_ip zone reverse_zone soa_admin_domain key_file old_fqdn new_fqdn ip new_serial new_reverse_serial].each do |value|
-        unless d[value]
-          fail_with_message """
-  Error gathering DNS data: couldn't find value for '#{value}'.
-  Make sure /etc/foreman-installer/scenarios.d/#{@options[:scenario]}-answers.yaml
-  'foreman-proxy' section has values for dns_zone, dns_reverse, and keyfile.
-  Make sure A and SOA records are present for #{@old_hostname}.
-"""
-        end
-      end
-
       STDOUT.puts 'updating DNS records:'
       # Use nsupdate to update DNS records
       # Update SOA record to new hostname; add new A and NS records; delete old A and NS records.
       # Multi-line strings are not indented because Ruby 2.0 doesn't support <<~ heredocs
 
       forward_dns_command = <<-HEREDOC
-local #{d.local_ip}
+local #{d.dns_server}
 zone #{d.zone}
 update add #{d.zone} 10800 SOA #{d.new_fqdn} #{d.soa_admin_domain}. #{d.new_serial} 86400 3600 604800 3600
 update add #{d.zone}. 3600 IN NS #{d.new_fqdn}.
@@ -361,7 +354,7 @@ send
       HEREDOC
 
       reverse_dns_command = <<-HEREDOC
-local #{d.local_ip}
+local #{d.dns_server}
 zone #{d.reverse_zone}
 update add #{d.reverse_zone} 10800 SOA #{d.new_fqdn} root.#{d.reverse_zone}. #{d.new_reverse_serial} 86400 3600 604800 3600
 update add #{d.reverse_zone} 3600 IN NS #{d.new_fqdn}
@@ -416,7 +409,7 @@ send
       self.precheck
 
       if should_update_dns?
-        update_dns_records(new_dns_values)
+        update_dns_records(@new_dns_values)
       end
 
       STDOUT.puts "updating hostname in /etc/hostname"
