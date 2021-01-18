@@ -41,6 +41,7 @@ Requires: %{?scl_prefix}rubygem(dynflow) >= 1.2.0
 Requires: %{?scl_prefix}rubygem(activerecord-import)
 Requires: %{?scl_prefix}rubygem(stomp)
 Requires: %{?scl_prefix}rubygem(scoped_search) >= 4.1.9
+Requires: %{?scl_prefix}rubygem(qpid_messaging)
 Requires: %{?scl_prefix}rubygem(gettext_i18n_rails)
 Requires: %{?scl_prefix}rubygem(apipie-rails) >= 0.5.14
 Requires: %{?scl_prefix}rubygem(fx) < 1.0
@@ -80,6 +81,7 @@ BuildRequires: %{?scl_prefix}rubygem(dynflow) >= 1.2.0
 BuildRequires: %{?scl_prefix}rubygem(activerecord-import)
 BuildRequires: %{?scl_prefix}rubygem(stomp)
 BuildRequires: %{?scl_prefix}rubygem(scoped_search) >= 4.1.9
+BuildRequires: %{?scl_prefix}rubygem(qpid_messaging)
 BuildRequires: %{?scl_prefix}rubygem(gettext_i18n_rails)
 BuildRequires: %{?scl_prefix}rubygem(apipie-rails) >= 0.5.14
 BuildRequires: %{?scl_prefix}rubygem(fx) < 1.0
