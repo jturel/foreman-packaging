@@ -9,7 +9,7 @@
 %global prereleasesource pre.master
 %global prerelease %{?prereleasesource:.}%{?prereleasesource}
 %global mainver 4.0.0
-%global release 2
+%global release 3
 
 Name:    %{?scl_prefix}rubygem-%{gem_name}
 Summary: Content and Subscription Management plugin for Foreman
@@ -235,6 +235,9 @@ cp -pa .%{gem_dir}/* \
 %{gem_instdir}/webpack
 
 %changelog
+* Mon Jan 18 2021 Jonathon Turel - 4.0.0-0.3.pre.master
+- Add qpid_messaging dependency back
+
 * Mon Nov 23 2020 Evgeni Golov - 4.0.0-0.2.pre.master
 - Update @theforeman/builder dependency
 
